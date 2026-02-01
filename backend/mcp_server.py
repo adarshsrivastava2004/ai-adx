@@ -91,19 +91,31 @@ class MCPServer:
         if not kql.strip().startswith(self.allowed_table):
             raise ValueError("KQL must start with StormEventsCopy")
 
-    # ---------------------------
+  # ---------------------------
     # STRUCTURE ENFORCEMENT
     # ---------------------------
     def enforce_structure(self, kql: str):
-        lines = [line.rstrip() for line in kql.splitlines() if line.strip()]
+        """
+        Validates that the query starts with the allowed table and
+        follows the basic KQL pipe structure, regardless of newlines.
+        """
+        # 1. Normalize: Remove leading/trailing whitespace
+        clean_kql = kql.strip()
 
-        if lines[0] != self.allowed_table:
-            raise ValueError("First line must be exactly StormEventsCopy")
+        # 2. Split by the pipe character '|'
+        # Example: "StormEventsCopy | where State == 'TX' | count"
+        # Becomes: ["StormEventsCopy ", " where State == 'TX' ", " count"]
+        segments = clean_kql.split('|')
 
-        for line in lines[1:]:
-            if not line.lstrip().startswith("|"):
-                raise ValueError("Every line after the first must start with '|'")
+        # 3. Validate the Table Name (First segment)
+        first_segment = segments[0].strip()
+        if first_segment != self.allowed_table:
+            raise ValueError(f"Query must start with exactly '{self.allowed_table}'")
 
+        # 4. (Optional) Basic sanity check for empty segments (e.g., "Table || count")
+        for i, segment in enumerate(segments[1:]):
+            if not segment.strip():
+                raise ValueError(f"Empty statement found after pipe #{i+1} (double pipes?)")
     # ---------------------------
     # SCHEMA ENFORCEMENT
     # ---------------------------

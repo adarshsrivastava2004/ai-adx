@@ -1,188 +1,151 @@
-# backend/query_planner.py
 import requests
 import re
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+# IMPORTANT: CHAT API (NOT generate)
+OLLAMA_URL = "http://localhost:11434/api/chat"
 MODEL = "qwen2.5:7b-instruct"
 
-SCHEMA_CONTEXT = """
-You are a deterministic Azure Data Explorer (Kusto / KQL) query generator.
-You behave like a compiler, not a chat assistant.
 
-ABSOLUTE BEHAVIOR:
-- You do NOT explain
-- You do NOT guess
-- You do NOT infer intent
-- You do NOT substitute concepts
-- You output ONLY raw KQL or NOTHING
-- If output is not 100% valid, output NOTHING
+# --------------------------------------------------
+# SYSTEM PROMPT
+# --------------------------------------------------
+SYSTEM_PROMPT = """
+You are an expert Azure Data Explorer (KQL) query generator.
 
-HARD FAILURE RULE (OVERRIDES ALL OTHERS):
-If the user request contains ANY word, concept, column, function, value, or intent
-that cannot be mapped DIRECTLY and EXACTLY to the allowed schema and rules below,
-you MUST output NOTHING.
+Table name: StormEventsCopy
 
-TARGET TABLE:
-StormEventsCopy
+Columns:
+- StartTime (datetime)
+- EndTime (datetime)
+- EpisodeId (int)
+- EventId (int)
+- State (string, values are uppercase like 'FLORIDA')
+- EventType (string)
+- DamageProperty (real)
+- DamageCrops (real)
 
-ALLOWED COLUMNS:
-StartTime
-EndTime
-EpisodeId
-EventId
-State
-EventType
-DamageProperty
-DamageCrops
-
-STATE RULE:
-- State values MUST be uppercase (e.g. "FLORIDA")
-- Lowercase or ambiguous state names → output NOTHING
-
-KNOWN EVENTTYPE VALUES (USE ONLY IF USER EXPLICITLY MENTIONS):
-Flood
-Drought
-Tornado
-Hail
-Thunderstorm
-Wildfire
-
-EVENTTYPE RULE:
-- Do NOT infer or substitute EventType
-- Unknown EventType → output NOTHING
-
-AGGREGATION RULES:
-- ALL aggregations MUST use summarize
-- sum() → totals
-- avg() → averages
-- count() → counts
-- ALL aggregated expressions MUST have an explicit alias
-- Do NOT use max, min, bin, dcount, percentiles, etc.
-
-TOP RULE:
-- Use top N ONLY if user explicitly says "top", "highest", or "most"
-- If N is missing → output NOTHING
-
-TIME RULES:
-- Time filters MUST use StartTime or EndTime
-- Time comparisons MUST use ago()
-- Do NOT infer time ranges (e.g. "recent")
-
-SYNTAX RULES:
-1. First line MUST be exactly: StormEventsCopy
-2. Every following line MUST start with '|'
-3. Use ONLY allowed columns
-4. Do NOT use let, extend, join, render
-5. Do NOT use semicolons
-6. Do NOT invent syntax
-7. If request is ambiguous or unsupported → output NOTHING
-
-ALLOWED TOKENS:
-StormEventsCopy
-|
-where
-summarize
-project
-order
-by
-top
-count
-sum
-avg
->=
-<=
-==
-and
-or
-ago
-(
-)
-"
-.
+Rules:
+- Always start query with: StormEventsCopy
+- Always generate valid KQL
+- Never invent syntax
+- Use summarize correctly:
+    - sum() for totals
+    - avg() for averages
+    - count() for counts
+- For top results use: top N by <metric> desc
+- Never use admin commands (.create, .drop, .set, .delete, .ingest)
+- Never use cluster(), database(), let, totable, extend, join, render
+- Only output raw KQL, no explanation
 """
 
-ALLOWED_TOKENS = {
-    "stormeventscopy", "|", "where", "summarize", "project", "order", "by", "top",
-    "count", "sum", "avg", ">=", "<=", "==", "and", "or", "ago",
-    "(", ")", "\"", "."
-}
 
+# --------------------------------------------------
+# SAFETY
+# --------------------------------------------------
 BLOCKED_KEYWORDS = [
     ".create", ".drop", ".delete", ".ingest", ".alter", ".set",
-    "cluster(", "database(", "let ", "extend", "join", "render",
-    "bin(", "year(", "month(", "max(", "min(", ";"
+    "cluster(", "database(", "let ", "totable", "extend",
+    "join", "render", ";"
 ]
 
 
-def generate_kql(user_goal: str) -> str:
-    prompt = f"""
-{SCHEMA_CONTEXT}
+# --------------------------------------------------
+# NORMALIZER
+# --------------------------------------------------
+def normalize_user_goal(goal: str) -> str:
+    g = goal.lower().strip()
 
-USER REQUEST:
-{user_goal}
-"""
+    if g in {
+        "total events",
+        "number of events",
+        "total number of events",
+        "count of events"
+    }:
+        return "count of events"
+
+    if g in {
+        "total damage",
+        "overall damage"
+    }:
+        return "total damage"
+
+    return goal
+
+
+# --------------------------------------------------
+# MAIN GENERATOR
+# --------------------------------------------------
+def generate_kql(user_goal: str) -> str:
+    normalized_goal = normalize_user_goal(user_goal)
 
     response = requests.post(
         OLLAMA_URL,
         json={
             "model": MODEL,
-            "prompt": prompt,
-            "stream": False
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT
+                },
+                {
+                    "role": "user",
+                    "content": normalized_goal
+                }
+            ],
+            "stream": False,
+            "options": {
+                "temperature": 0
+            }
         },
         timeout=30
     )
 
-    raw_output = response.json().get("response", "").strip()
+    data = response.json()
 
-    if not raw_output:
+    # CHAT API response
+    if "message" not in data or "content" not in data["message"]:
         return ""
 
-    return validate_kql(raw_output)
+    kql = data["message"]["content"].strip()
+    return sanitize_kql(kql)
 
 
-def validate_kql(kql: str) -> str:
+# --------------------------------------------------
+# SANITIZER
+# --------------------------------------------------
+def sanitize_kql(kql: str) -> str:
     lowered = kql.lower()
 
-    # Hard block unsafe keywords
     for word in BLOCKED_KEYWORDS:
         if word in lowered:
-            raise ValueError(f"Blocked KQL keyword detected: {word}")
+            raise ValueError(f"Unsafe KQL detected: {word}")
 
-    # Must start with table
     if not kql.startswith("StormEventsCopy"):
         raise ValueError("KQL must start with StormEventsCopy")
 
-    # Line rules
-    lines = kql.splitlines()
-    if lines[0].strip() != "StormEventsCopy":
-        raise ValueError("First line must be exactly StormEventsCopy")
-
-    for line in lines[1:]:
-        if not line.strip().startswith("|"):
-            raise ValueError("Every line after the first must start with '|'")
-
-    # Token-level enforcement (simple lexer)
-    tokens = re.findall(r'[A-Za-z_]+|>=|<=|==|\(|\)|\||"', lowered)
-
-    for token in tokens:
-        if token not in ALLOWED_TOKENS and not re.match(r"[a-z_]+", token):
-            raise ValueError(f"Disallowed token detected: {token}")
+    # Fix common model mistake: count → count()
+    kql = re.sub(r"\bcount\b(?!\()", "count()", kql)
 
     return kql
 
 
+# --------------------------------------------------
+# LOCAL TEST
+# --------------------------------------------------
 if __name__ == "__main__":
+    print("=== QUERY PLANNER TEST MODE ===")
+
     while True:
-        user_input = input("User query (or 'exit'): ").strip()
-        if user_input.lower() == "exit":
+        q = input("\nUser query (or 'exit'): ").strip()
+        if q.lower() == "exit":
             break
 
         try:
-            result = generate_kql(user_input)
-            if result:
+            out = generate_kql(q)
+            if out:
                 print("\nGenerated KQL:\n")
-                print(result)
+                print(out)
             else:
-                print("\nNO OUTPUT (request unsupported or ambiguous)\n")
+                print("\nNO OUTPUT\n")
         except Exception as e:
-            print(f"\nERROR: {e}\n")
+            print("\nERROR:", e)

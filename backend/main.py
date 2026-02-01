@@ -4,78 +4,83 @@ from backend.orchestrator import llm_decider
 from backend.query_planner import generate_kql
 from backend.adx_client import run_kql
 from backend.mcp_server import MCPServer
-from backend.formatter import format_response   # ✅ formatter import
+from backend.formatter import format_response
+from backend.chat_llm import chat_llm
+
+from fastapi.middleware.cors import CORSMiddleware
 
 
-# -----------------------
-# FastAPI app
-# -----------------------
 app = FastAPI(title="LLM + ADX + MCP Backend")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# -----------------------
-# MCP server (control plane)
-# -----------------------
 mcp = MCPServer()
 
 
-# -----------------------
-# Intelligent endpoint
-# -----------------------
 @app.post("/chat")
 def chat(req: ChatRequest):
-    user_message = req.message
+    user_message = req.message.strip()
 
     # -----------------------
     # Step 1: Orchestrator
     # -----------------------
     decision = llm_decider(user_message)
 
+    print(f"""
+================ ROUTER DECISION ================
+User Query : {user_message}
+Tool       : {decision.tool}
+Query Goal : {decision.query_goal}
+================================================
+""")
+
     # -----------------------
-    # CHAT PATH
+    # CHAT (greetings only)
     # -----------------------
     if decision.tool == "chat":
-        raw_result = {
-            "tool": "chat",
-            "reply": "This question does not require database access."
-        }
+        return {"reply": chat_llm(user_message)}
 
-        final_answer = format_response(user_message, raw_result)
-        return {"reply": final_answer}
+    # -----------------------
+    # OUT OF SCOPE (NO FORMATTER)
+    # -----------------------
+    if decision.tool == "out_of_scope":
+        return {
+            "reply": (
+                "I can help with storm event data questions "
+                "like damage, events, states, and time ranges. "
+                "This question is outside that scope."
+            )
+        }
 
     # -----------------------
     # ADX PATH
     # -----------------------
     if decision.tool == "adx":
 
-        # Stop on ambiguous goal
+        # Guard: empty goal
         if not decision.query_goal.strip():
-            raw_result = {
-                "tool": "adx",
-                "error": "Ambiguous or unsupported query goal"
+            return {
+                "reply": "I couldn't understand a clear data request. "
+                         "Please rephrase your question."
             }
 
-            final_answer = format_response(user_message, raw_result)
-            return {"reply": final_answer}
-
         try:
-            # -----------------------
-            # Step 2: Query Planner
-            # -----------------------
+            # Step 2: Query planner
             kql = generate_kql(decision.query_goal)
 
             if not kql:
-                raw_result = {
-                    "tool": "adx",
-                    "error": "Query planner could not generate a valid query"
+                return {
+                    "reply": "I couldn't generate a valid query for this request. "
+                             "Please rephrase it more clearly."
                 }
 
-                final_answer = format_response(user_message, raw_result)
-                return {"reply": final_answer}
-
-            # -----------------------
-            # Step 3: MCP
-            # -----------------------
+            # Step 3: MCP validation
             mcp_result = mcp.process(
                 tool="adx",
                 kql=kql,
@@ -84,35 +89,37 @@ def chat(req: ChatRequest):
 
             validated_kql = mcp_result["validated_kql"]
 
-            # -----------------------
-            # Step 4: ADX Execution
-            # -----------------------
+            # Step 4: ADX execution
             data = run_kql(validated_kql)
 
-            raw_result = {
-                "tool": "adx",
+            # Guard: no data
+            if not data:
+                return {
+                    "reply": "No data was found for your request."
+                }
+
+            # ✅ ONLY place where formatter is allowed
+            safe_result = {
                 "rows": len(data),
                 "data": data
             }
 
-            final_answer = format_response(user_message, raw_result)
+            final_answer = format_response(user_message, safe_result)
             return {"reply": final_answer}
 
         except Exception as e:
-            raw_result = {
-                "tool": "adx",
-                "error": str(e)
+            # ❌ NO formatter for system / ADX errors
+            print("[ADX ERROR]", str(e))
+            return {
+                "reply": (
+                    "I couldn't retrieve the data right now due to a system issue. "
+                    "Please try again later."
+                )
             }
 
-            final_answer = format_response(user_message, raw_result)
-            return {"reply": final_answer}
-
     # -----------------------
-    # FALLBACK (should never hit)
+    # HARD SAFETY FALLBACK
     # -----------------------
-    raw_result = {
-        "error": "Invalid tool decision"
+    return {
+        "reply": "Sorry, I couldn't process your request."
     }
-
-    final_answer = format_response(user_message, raw_result)
-    return {"reply": final_answer}
