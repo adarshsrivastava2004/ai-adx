@@ -3,47 +3,34 @@ import uuid
 import time
 from typing import Dict
 
-
 class MCPServer:
     def __init__(self):
         self.allowed_table = "StormEventsCopy"
 
         self.allowed_columns = {
-            "StartTime",
-            "EndTime",
-            "EpisodeId",
-            "EventId",
-            "State",
-            "EventType",
-            "DamageProperty",
-            "DamageCrops",
+            "StartTime", "EndTime", "EpisodeId", "EventId", "State",
+            "EventType", "DamageProperty", "DamageCrops"
         }
 
-        # Allowed KQL keywords (lowercase)
+        # FIX: Added "count_" to the allowed keywords list
         self.allowed_keywords = {
-            "stormeventscopy",
-            "where",
-            "summarize",
-            "by",
-            "top",
-            "order",
-            "count",
-            "sum",
-            "avg",
-            "and",
-            "or",
-            "ago",
+            "stormeventscopy", "where", "summarize", "by", "top", "order",
+            "count", "count_", "sum", "avg", "min", "max", "dcount", # <--- Added count_
+            "and", "or", "ago", "desc", "asc", "limit", "take", "project",
+            "sort", "distinct", "arg_max", "arg_min"
         }
 
-        # Allowed comparison operators
-        self.allowed_operators = {">=", "<=", "=="}
+        # Expanded comparison operators
+        self.allowed_operators = {
+            ">=", "<=", "==", "!=", ">", "<", 
+            "in", "contains", "has", "startswith", "endswith"
+        }
 
         # Hard-blocked patterns (SECURITY ONLY)
         self.blocked_keywords = [
             ".create", ".drop", ".delete", ".ingest", ".alter", ".set",
-            "cluster(", "database(", "external_table",
-            "let ", "extend", "join", "render",
-            "bin(", "year(", "month(", "max(", "min(", ";"
+            "cluster(", "database(", "external_table", "plugin",
+            "render", "mv-expand", "evaluate"
         ]
 
     # ---------------------------
@@ -65,10 +52,10 @@ class MCPServer:
         if not kql or not kql.strip():
             raise ValueError("Empty KQL is not allowed")
 
-        self.validate_kql(kql)
-        self.enforce_structure(kql)
-        self.enforce_schema(kql)
-        self.enforce_tokens(kql)
+        # Validation Pipeline
+        self.validate_safety(kql)        # Step 1: Check for malicious keywords
+        self.enforce_structure(kql)      # Step 2: Check | pipe structure
+        self.enforce_schema(kql)         # Step 3: Check columns & whitelist
 
         latency = round(time.time() - start, 3)
         self.log(trace_id, "ACCEPTED", {"latency_sec": latency})
@@ -79,106 +66,112 @@ class MCPServer:
         }
 
     # ---------------------------
-    # BASIC VALIDATION
+    # 1. SAFETY CHECKS
     # ---------------------------
-    def validate_kql(self, kql: str):
+    def validate_safety(self, kql: str):
+        """Checks for explicitly banned dangerous keywords."""
         lowered = kql.lower()
-
         for word in self.blocked_keywords:
             if word in lowered:
                 raise ValueError(f"MCP blocked unsafe keyword: {word}")
 
-        if not kql.strip().startswith(self.allowed_table):
-            raise ValueError("KQL must start with StormEventsCopy")
-
-  # ---------------------------
-    # STRUCTURE ENFORCEMENT
+    # ---------------------------
+    # 2. STRUCTURE ENFORCEMENT
     # ---------------------------
     def enforce_structure(self, kql: str):
         """
         Validates that the query starts with the allowed table and
-        follows the basic KQL pipe structure, regardless of newlines.
+        follows the basic KQL pipe structure, ignoring whitespace/newlines.
         """
-        # 1. Normalize: Remove leading/trailing whitespace
         clean_kql = kql.strip()
-
-        # 2. Split by the pipe character '|'
-        # Example: "StormEventsCopy | where State == 'TX' | count"
-        # Becomes: ["StormEventsCopy ", " where State == 'TX' ", " count"]
+        
+        # Split by pipe to separate operations
         segments = clean_kql.split('|')
-
-        # 3. Validate the Table Name (First segment)
+        
+        # Check Table Name (Must be first)
         first_segment = segments[0].strip()
         if first_segment != self.allowed_table:
-            raise ValueError(f"Query must start with exactly '{self.allowed_table}'")
+             raise ValueError(f"Query must start with exactly '{self.allowed_table}'")
 
-        # 4. (Optional) Basic sanity check for empty segments (e.g., "Table || count")
+        # Check for empty pipes (e.g. "Table || count")
         for i, segment in enumerate(segments[1:]):
             if not segment.strip():
-                raise ValueError(f"Empty statement found after pipe #{i+1} (double pipes?)")
+                raise ValueError(f"Empty statement found after pipe #{i+1}")
+
     # ---------------------------
-    # SCHEMA ENFORCEMENT
+    # 3. SCHEMA & TOKEN ENFORCEMENT
     # ---------------------------
     def enforce_schema(self, kql: str):
-        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", kql)
+        """
+        Validates tokens against whitelist. 
+        CRITICAL FIX: Strips string literals ("Texas") so they aren't flagged as columns.
+        """
+        
+        # Step A: Remove String Literals & Comments
+        # We replace them with a dummy space so validation ignores user data values
+        sanitized_kql = self._strip_literals_and_comments(kql)
 
-        kql_keywords = {
-            "summarize", "count", "sum", "avg", "by",
-            "where", "top", "order", "and", "or", "ago"
-        }
+        # Step B: Extract potential tokens (words)
+        # Matches alphanumeric sequences including underscore
+        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", sanitized_kql)
 
         for token in tokens:
-            if token in kql_keywords:
+            lowered_token = token.lower()
+
+            # 1. Check Keywords (case-insensitive)
+            if lowered_token in self.allowed_keywords:
+                continue
+            
+            # 2. Check Operators that look like words (in, contains)
+            if lowered_token in self.allowed_operators:
                 continue
 
+            # 3. Check Table Name (exact match usually required, but we allow safe fallback)
             if token == self.allowed_table:
                 continue
 
+            # 4. Check Column Names (Case sensitive usually matters in KQL, but we check set)
             if token in self.allowed_columns:
                 continue
 
-            if self._is_alias(token, kql):
+            # 5. Check if it's a declared variable/alias (e.g., "NewCol =" or "NewCol=")
+            if self._is_alias_definition(token, kql):
+                continue
+            
+            # 6. Allow numbers (Regex didn't catch them, but just in case)
+            if token.isdigit():
                 continue
 
-            raise ValueError(f"MCP blocked unknown column or identifier: {token}")
-
-    def _is_alias(self, token: str, kql: str) -> bool:
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", token):
-            return False
-
-        return re.search(
-            rf"\b{token}\s*=\s*(sum|avg|count)\(",
-            kql
-        ) is not None
+            raise ValueError(f"MCP blocked unknown identifier: '{token}'")
 
     # ---------------------------
-    # TOKEN ENFORCEMENT
+    # HELPERS
     # ---------------------------
-    def enforce_tokens(self, kql: str):
-        raw_tokens = re.findall(r">=|<=|==|\b[A-Za-z_]+\b", kql)
+    def _strip_literals_and_comments(self, text: str) -> str:
+        """
+        Removes content inside quotes ('...' or "...") and KQL comments (// ...).
+        This allows users to query data values like 'Texas' without validation errors.
+        """
+        # Remove KQL comments (// ...)
+        text = re.sub(r"//.*", " ", text)
+        
+        # Remove single-quoted strings '...'
+        text = re.sub(r"'[^']*'", " ", text)
+        
+        # Remove double-quoted strings "..."
+        text = re.sub(r'"[^"]*"', " ", text)
+        
+        return text
 
-        for tok in raw_tokens:
-            if tok in self.allowed_operators:
-                continue
+    def _is_alias_definition(self, token: str, original_kql: str) -> bool:
+        """
+        Checks if 'token' is being defined as a new column name.
+        Pattern: "token =" or "token="
+        """
+        # Look for the token followed immediately by optional space and =
+        pattern = rf"\b{re.escape(token)}\s*="
+        return re.search(pattern, original_kql) is not None
 
-            if tok.lower() in self.allowed_keywords:
-                continue
-
-            if tok == self.allowed_table:
-                continue
-
-            if tok in self.allowed_columns:
-                continue
-
-            if self._is_alias(tok, kql):
-                continue
-
-            raise ValueError(f"MCP blocked invalid token: {tok}")
-
-    # ---------------------------
-    # LOGGING
-    # ---------------------------
     def log(self, trace_id: str, stage: str, data: Dict):
-        print(f"\n[MCP] trace_id={trace_id}")
-        print(f"[MCP] stage={stage}")
-        print(f"[MCP] data={data}")
+        print(f"\n[MCP] trace_id={trace_id} | stage={stage}")
+        # print(f"[MCP] data={data}") # Uncomment for verbose debugging
