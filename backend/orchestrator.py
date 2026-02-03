@@ -3,10 +3,9 @@
 import requests
 import json
 from backend.schemas import ToolDecision
+from backend.config import OLLAMA_CHAT_URL, MODEL
 
 # NOTE: Switched to /api/chat for better structured output support
-OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "qwen2.5:7b-instruct"
 
 # We define the JSON Schema explicitly here.
 # This forces the LLM to follow this EXACT structure.
@@ -106,7 +105,7 @@ def llm_decider(user_input: str) -> ToolDecision:
 
     try:
         response = requests.post(
-            OLLAMA_URL,
+            OLLAMA_CHAT_URL,
             json={
                 "model": MODEL,
                 "messages": [

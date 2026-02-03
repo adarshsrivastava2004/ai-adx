@@ -5,9 +5,7 @@
 # - No DB, no JSON, no formatter logic here
 
 import requests
-
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen2.5:7b-instruct"
+from backend.config import OLLAMA_GENERATE_URL, MODEL
 
 
 SYSTEM_PROMPT = """

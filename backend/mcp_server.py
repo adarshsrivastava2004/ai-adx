@@ -1,3 +1,4 @@
+# backend/mcp_server.py
 import re
 import uuid
 import time
@@ -7,171 +8,98 @@ class MCPServer:
     def __init__(self):
         self.allowed_table = "StormEventsCopy"
 
-        self.allowed_columns = {
-            "StartTime", "EndTime", "EpisodeId", "EventId", "State",
-            "EventType", "DamageProperty", "DamageCrops"
-        }
-
-        # FIX: Added "count_" to the allowed keywords list
-        self.allowed_keywords = {
-            "stormeventscopy", "where", "summarize", "by", "top", "order",
-            "count", "count_", "sum", "avg", "min", "max", "dcount", # <--- Added count_
-            "and", "or", "ago", "desc", "asc", "limit", "take", "project",
-            "sort", "distinct", "arg_max", "arg_min"
-        }
-
-        # Expanded comparison operators
-        self.allowed_operators = {
-            ">=", "<=", "==", "!=", ">", "<", 
-            "in", "contains", "has", "startswith", "endswith"
-        }
-
-        # Hard-blocked patterns (SECURITY ONLY)
-        self.blocked_keywords = [
-            ".create", ".drop", ".delete", ".ingest", ".alter", ".set",
-            "cluster(", "database(", "external_table", "plugin",
-            "render", "mv-expand", "evaluate"
+        # ---------------------------------------------------------
+        # BLOCKLIST: Sirf dangerous patterns ko block karenge
+        # ---------------------------------------------------------
+        self.blocked_patterns = [
+            r"^\s*\.",          # Control commands start with dot (.)
+            r"\.drop\b",        # Explicit drops
+            r"\.alter\b",       # Explicit alters
+            r"\.create\b",      # Explicit creates
+            r"\.set\b",         # Setting policies
+            r"\.ingest\b",      # Ingesting data
+            r";"                # Semicolon (SQL Injection prevention)
         ]
 
     # ---------------------------
     # ENTRY POINT
     # ---------------------------
     def process(self, tool: str, kql: str, goal: str) -> Dict:
+        # 1. Start Tracing
         trace_id = str(uuid.uuid4())
-        start = time.time()
+        start_time = time.time()
 
+        # 2. LOG REQUEST (Jaisa aap chahte thay)
         self.log(trace_id, "REQUEST", {
             "tool": tool,
             "goal": goal,
             "kql": kql
         })
 
-        if tool != "adx":
-            raise ValueError("MCPServer received non-adx tool request")
+        try:
+            if tool != "adx":
+                raise ValueError("MCPServer received non-adx tool request")
 
-        if not kql or not kql.strip():
-            raise ValueError("Empty KQL is not allowed")
+            if not kql or not kql.strip():
+                raise ValueError("Empty KQL is not allowed")
 
-        # Validation Pipeline
-        self.validate_safety(kql)        # Step 1: Check for malicious keywords
-        self.enforce_structure(kql)      # Step 2: Check | pipe structure
-        self.enforce_schema(kql)         # Step 3: Check columns & whitelist
+            # 3. Basic Cleanup
+            clean_kql = kql.strip()
 
-        latency = round(time.time() - start, 3)
-        self.log(trace_id, "ACCEPTED", {"latency_sec": latency})
+            # 4. Security Check (Block Dangerous Commands)
+            self.validate_safety(clean_kql)
 
-        return {
-            "trace_id": trace_id,
-            "validated_kql": kql
-        }
+            # 5. Table Check (Must start with correct table)
+            self.validate_table_access(clean_kql)
+
+            # 6. Success Logging
+            latency = round(time.time() - start_time, 3)
+            self.log(trace_id, "ACCEPTED", {"latency_sec": latency})
+
+            return {
+                "trace_id": trace_id,
+                "validated_kql": clean_kql
+            }
+
+        except Exception as e:
+            # Error Logging
+            latency = round(time.time() - start_time, 3)
+            self.log(trace_id, "BLOCKED", {"error": str(e), "latency_sec": latency})
+            raise e
 
     # ---------------------------
-    # 1. SAFETY CHECKS
+    # SECURITY LOGIC
     # ---------------------------
     def validate_safety(self, kql: str):
-        """Checks for explicitly banned dangerous keywords."""
-        lowered = kql.lower()
-        for word in self.blocked_keywords:
-            if word in lowered:
-                raise ValueError(f"MCP blocked unsafe keyword: {word}")
+        """
+        Block commands starting with dot (.) or containing explicit admin keywords.
+        """
+        # Rule 1: KQL Admin commands start with dot (.)
+        if kql.startswith("."):
+            raise ValueError("Security Alert: Control commands (starting with '.') are NOT allowed.")
+
+        # Rule 2: Check regex patterns for dangerous keywords
+        for pattern in self.blocked_patterns:
+            if re.search(pattern, kql, re.IGNORECASE | re.MULTILINE):
+                raise ValueError(f"Security Alert: Blocked pattern detected -> {pattern}")
+
+    def validate_table_access(self, kql: str):
+        """
+        Ensure the query actually starts with the allowed table.
+        Splits by pipe '|' to safely get the first token.
+        """
+        # Split by pipe to get the first part (e.g., "StormEventsCopy ")
+        parts = kql.split("|")
+        first_word = parts[0].strip()
+        
+        # Check if the query starts with the table name
+        if first_word != self.allowed_table:
+            raise ValueError(f"Access Denied: You can only query table '{self.allowed_table}'. Found: '{first_word}'")
 
     # ---------------------------
-    # 2. STRUCTURE ENFORCEMENT
+    # LOGGING
     # ---------------------------
-    def enforce_structure(self, kql: str):
-        """
-        Validates that the query starts with the allowed table and
-        follows the basic KQL pipe structure, ignoring whitespace/newlines.
-        """
-        clean_kql = kql.strip()
-        
-        # Split by pipe to separate operations
-        segments = clean_kql.split('|')
-        
-        # Check Table Name (Must be first)
-        first_segment = segments[0].strip()
-        if first_segment != self.allowed_table:
-             raise ValueError(f"Query must start with exactly '{self.allowed_table}'")
-
-        # Check for empty pipes (e.g. "Table || count")
-        for i, segment in enumerate(segments[1:]):
-            if not segment.strip():
-                raise ValueError(f"Empty statement found after pipe #{i+1}")
-
-    # ---------------------------
-    # 3. SCHEMA & TOKEN ENFORCEMENT
-    # ---------------------------
-    def enforce_schema(self, kql: str):
-        """
-        Validates tokens against whitelist. 
-        CRITICAL FIX: Strips string literals ("Texas") so they aren't flagged as columns.
-        """
-        
-        # Step A: Remove String Literals & Comments
-        # We replace them with a dummy space so validation ignores user data values
-        sanitized_kql = self._strip_literals_and_comments(kql)
-
-        # Step B: Extract potential tokens (words)
-        # Matches alphanumeric sequences including underscore
-        tokens = re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", sanitized_kql)
-
-        for token in tokens:
-            lowered_token = token.lower()
-
-            # 1. Check Keywords (case-insensitive)
-            if lowered_token in self.allowed_keywords:
-                continue
-            
-            # 2. Check Operators that look like words (in, contains)
-            if lowered_token in self.allowed_operators:
-                continue
-
-            # 3. Check Table Name (exact match usually required, but we allow safe fallback)
-            if token == self.allowed_table:
-                continue
-
-            # 4. Check Column Names (Case sensitive usually matters in KQL, but we check set)
-            if token in self.allowed_columns:
-                continue
-
-            # 5. Check if it's a declared variable/alias (e.g., "NewCol =" or "NewCol=")
-            if self._is_alias_definition(token, kql):
-                continue
-            
-            # 6. Allow numbers (Regex didn't catch them, but just in case)
-            if token.isdigit():
-                continue
-
-            raise ValueError(f"MCP blocked unknown identifier: '{token}'")
-
-    # ---------------------------
-    # HELPERS
-    # ---------------------------
-    def _strip_literals_and_comments(self, text: str) -> str:
-        """
-        Removes content inside quotes ('...' or "...") and KQL comments (// ...).
-        This allows users to query data values like 'Texas' without validation errors.
-        """
-        # Remove KQL comments (// ...)
-        text = re.sub(r"//.*", " ", text)
-        
-        # Remove single-quoted strings '...'
-        text = re.sub(r"'[^']*'", " ", text)
-        
-        # Remove double-quoted strings "..."
-        text = re.sub(r'"[^"]*"', " ", text)
-        
-        return text
-
-    def _is_alias_definition(self, token: str, original_kql: str) -> bool:
-        """
-        Checks if 'token' is being defined as a new column name.
-        Pattern: "token =" or "token="
-        """
-        # Look for the token followed immediately by optional space and =
-        pattern = rf"\b{re.escape(token)}\s*="
-        return re.search(pattern, original_kql) is not None
-
     def log(self, trace_id: str, stage: str, data: Dict):
-        print(f"\n[MCP] trace_id={trace_id} | stage={stage}")
-        # print(f"[MCP] data={data}") # Uncomment for verbose debugging
+        print(f"\n[MCP] trace_id={trace_id}")
+        print(f"[MCP] stage={stage}")
+        print(f"[MCP] data={data}")

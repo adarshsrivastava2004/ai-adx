@@ -1,3 +1,4 @@
+# backend/main.py
 from fastapi import FastAPI
 from backend.schemas import ChatRequest
 from backend.orchestrator import llm_decider
@@ -8,7 +9,6 @@ from backend.formatter import format_response
 from backend.chat_llm import chat_llm
 
 from fastapi.middleware.cors import CORSMiddleware
-
 
 app = FastAPI(title="LLM + ADX + MCP Backend")
 
@@ -21,7 +21,6 @@ app.add_middleware(
 )
 
 mcp = MCPServer()
-
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -62,12 +61,10 @@ Query Goal : {decision.query_goal}
     # ADX PATH
     # -----------------------
     if decision.tool == "adx":
-
         # Guard: empty goal
         if not decision.query_goal.strip():
             return {
-                "reply": "I couldn't understand a clear data request. "
-                         "Please rephrase your question."
+                "reply": "I couldn't understand a clear data request. Please rephrase your question."
             }
 
         try:
@@ -76,8 +73,7 @@ Query Goal : {decision.query_goal}
 
             if not kql:
                 return {
-                    "reply": "I couldn't generate a valid query for this request. "
-                             "Please rephrase it more clearly."
+                    "reply": "I couldn't generate a valid query for this request. Please rephrase it more clearly."
                 }
 
             # Step 3: MCP validation
@@ -86,7 +82,6 @@ Query Goal : {decision.query_goal}
                 kql=kql,
                 goal=decision.query_goal
             )
-
             validated_kql = mcp_result["validated_kql"]
 
             # Step 4: ADX execution
@@ -98,18 +93,42 @@ Query Goal : {decision.query_goal}
                     "reply": "No data was found for your request."
                 }
 
-            # ✅ ONLY place where formatter is allowed
-            safe_result = {
-                "rows": len(data),
-                "data": data
+            # =========================================================
+            # ✅ CRITICAL FIX 1: Convert DateTime objects to Strings
+            # JSON cannot serialize datetime objects, so we convert them here.
+            # =========================================================
+            safe_data = []
+            for row in data:
+                clean_row = {}
+                for key, value in row.items():
+                    # Check if the value is a Date/Time object and convert it
+                    if hasattr(value, 'isoformat'):
+                        clean_row[key] = value.isoformat()
+                    else:
+                        clean_row[key] = value
+                safe_data.append(clean_row)
+
+            # =========================================================
+            # ✅ CRITICAL FIX 2: Prevent LLM Context Overflow
+            # We only send the top 15 rows to the AI for explanation.
+            # This prevents the "Context Window Exceeded" crash.
+            # =========================================================
+            MAX_ROWS_FOR_LLM = 15
+            preview_data = safe_data[:MAX_ROWS_FOR_LLM]
+
+            system_result = {
+                "total_rows_found": len(safe_data),
+                "rows_shown_to_ai": len(preview_data),
+                "data_sample": preview_data,
+                "note": "Data truncated for performance" if len(safe_data) > MAX_ROWS_FOR_LLM else "Full data shown"
             }
 
-            final_answer = format_response(user_message, safe_result)
+            final_answer = format_response(user_message, system_result)
             return {"reply": final_answer}
 
         except Exception as e:
-            # ❌ NO formatter for system / ADX errors
-            print("[ADX ERROR]", str(e))
+            # ❌ PRINT ERROR so you can see it in terminal
+            print(f"[ADX PROCESSING ERROR]: {str(e)}")
             return {
                 "reply": (
                     "I couldn't retrieve the data right now due to a system issue. "
