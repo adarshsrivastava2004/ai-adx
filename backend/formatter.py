@@ -5,6 +5,7 @@
 
 import json
 import requests
+import traceback
 from backend.config import OLLAMA_GENERATE_URL, MODEL
 
 
@@ -58,19 +59,27 @@ Generate the best possible answer for the user.
 """
 
         response = requests.post(
-            OLLAMA_URL,
+            OLLAMA_GENERATE_URL,
             json={
                 "model": MODEL,
                 "prompt": prompt,
                 "stream": False
             },
-            timeout=30
+            timeout=120
         )
 
         return response.json()["response"].strip()
 
-    except Exception:
-        # FIX: Prevent backend crash if Ollama is down or unreachable
+    except Exception as e:
+        # ==================================================
+        # ✅ DEBUG PRINT: Show me the error in the terminal!
+        # ==================================================
+        print("\n" + "="*40)
+        print("❌ FORMATTER CRASHED")
+        print(f"Error: {str(e)}")
+        print("Traceback:")
+        print(traceback.format_exc())
+        print("="*40 + "\n")
         return (
             "Sorry, I’m unable to generate a response right now. "
             "Please try again in a moment."

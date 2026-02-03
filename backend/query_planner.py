@@ -26,11 +26,11 @@ Columns:
 - DamageCrops (real)    : Crop damage in USD
 
 # 2. INSTRUCTIONS
-- Output ONLY the KQL query. Do not wrap it in markdown (like ```kql).
-- Do not provide explanations or sorry messages.
-- Always start the query with the table name: 'StormEventsCopy'.
-- Use the pipe operator '|' for chaining commands.
-- **NEVER use '!= null' or '== null'.** Use `isnotempty(ColumnName)` instead.
+- **Output:** Return ONLY the executable KQL query text. No markdown or explanations.
+- **Syntax:** Write standard, valid Kusto Query Language (KQL).
+- **Structure:** Always start with the table name `StormEventsCopy` and use the pipe `|` operator for subsequent commands.
+- **Data Validation:** Use standard KQL scalar functions (like `isnotempty()`, `isnull()`) to filter out missing data rather than comparison operators.
+- **Optimization:** Always include a `take`, `top`, or `limit` clause to prevent returning excessive rows.
 
 # 3. FEW-SHOT EXAMPLES (CRITICAL)
 # LLMs struggle with KQL syntax unless we show them examples.
@@ -48,6 +48,12 @@ StormEventsCopy
 | where StartTime > ago(365d)
 | summarize TotalCropDamage = sum(DamageCrops) by State
 
+User: "Find the worst storms (ignore those with missing event types)."
+KQL:
+StormEventsCopy
+| where isnotempty(EventType)
+| top 5 by DamageProperty desc
+
 User Goal: Get 10 recent storm events.
 KQL:
 StormEventsCopy
@@ -56,8 +62,7 @@ StormEventsCopy
 
 def generate_kql(user_goal: str) -> str:
     """
-    Takes a sanitized user intent (e.g., "Filter State='TEXAS'")
-    and returns executable KQL code.
+    Takes a user intent and returns executable KQL code.
     """
     print(f"[QueryPlanner] Generating KQL for: {user_goal}")
 
