@@ -1,70 +1,72 @@
 # backend/query_planner.py
 import requests
 import re
+import logging
 from backend.config import OLLAMA_CHAT_URL, MODEL
 
+
+# Setup Logger (Production Standard)
+logger = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# SYSTEM PROMPT
-# This is the "brain" of the query generator.
-# We must provide context (Schema) and examples (Few-Shot) to get good KQL.
+# ENTERPRISE SYSTEM PROMPT (OPTIMIZED)
+# Changes:
+# 1. Enforced Case Insensitivity (=~)
+# 2. Added "Performance First" rule (Time filters first)
+# 3. Explicitly allowed 'let' statements
 # ---------------------------------------------------------------------------
+
 SYSTEM_PROMPT = """
-You are an expert Azure Data Explorer (KQL) query generator.
+You are an expert Principal Data Engineer converting natural language to Azure Data Explorer (KQL).
+Your goal is to generate HIGH-PERFORMANCE, PRODUCTION-GRADE queries for massive datasets.
 
 # 1. DATABASE SCHEMA
-# We explicitly list the columns so the LLM knows what fields exist.
-# Without this, it might hallucinate columns like "StormCategory" or "Cost".
 Table: StormEventsCopy
 Columns:
-- StartTime (datetime)
-- EndTime (datetime)
-- EpisodeId (int)
-- EventId (int)
-- State (string)        : e.g., 'TEXAS', 'FLORIDA' (Upper case)
-- EventType (string)    : e.g., 'Flood', 'Tornado', 'Hail'
-- DamageProperty (real) : Financial damage in USD
-- DamageCrops (real)    : Crop damage in USD
+- StartTime (datetime), EndTime (datetime)
+- EpisodeId (int), EventId (int)
+- State (string), EventType (string)
+- DamageProperty (real), DamageCrops (real)
 
-# 2. INSTRUCTIONS
-- **Output:** Return ONLY the executable KQL query text. No markdown or explanations.
-- **Syntax:** Write standard, valid Kusto Query Language (KQL).
-- **Structure:** Always start with the table name `StormEventsCopy` and use the pipe `|` operator for subsequent commands.
-- **Data Validation:** Use standard KQL scalar functions (like `isnotempty()`, `isnull()`) to filter out missing data rather than comparison operators.
-- **Optimization:** Always include a `take`, `top`, or `limit` clause to prevent returning excessive rows.
+# 2. CRITICAL RULES (Strict Enforcement)
+- **Output Format:** RAW TEXT ONLY. Do not use markdown backticks (```). Do not write explanations.
+- **Case Insensitivity:** ALWAYS use `=~` for string equality and `has` for substring searches. Never use `==` for user input.
+- **Performance First:** Put time filters (e.g., `where StartTime > ...`) immediately after the table name whenever a time context is implied.
+- **Time Handling:** - NEVER use `format_datetime` inside a `summarize` or `bin` function.
+  - ALWAYS use `bin(StartTime, 1d)` directly on the raw datetime column.
+- **INVALID UNITS:** `1y`, `1mo` are NOT valid KQL.
+- **VALID UNITS:** Use `365d` for years, `30d` for months, `1d` for days, `1h` for hours.
+  - Example: Use `bin(StartTime, 365d)` instead of `bin(StartTime, 1y)`.
+- **Massive Data Policy:**
+  - If the user implies "All data" or "Trends" without filters -> Generate a `summarize count() by bin(StartTime, ...)` query.
+  - **NEVER** use `take` or `limit` on broad analytical queries; use aggregations instead.
 
-# 3. FEW-SHOT EXAMPLES (CRITICAL)
-# LLMs struggle with KQL syntax unless we show them examples.
-# These examples teach the model how to map "Human Intent" -> "KQL Code".
+# 3. STRATEGY PATTERNS
 
-User Goal: Filter where State is TEXAS and EventType is Flood. Show top 5 by DamageProperty.
-KQL:
+# PATTERN 1: Broad/Massive Request ("Show me all events", "Total data", "Timeline")
 StormEventsCopy
-| where State == "TEXAS" and EventType == "Flood"
-| top 5 by DamageProperty desc
+| summarize EventCount = count() by bin(StartTime, 1d)
+| order by StartTime desc
+| render timechart
 
-User Goal: Show total DamageCrops per State for the last 365 days.
-KQL:
+# PATTERN 2: High Impact/Specific Analysis ("Worst floods in Texas")
 StormEventsCopy
-| where StartTime > ago(365d)
-| summarize TotalCropDamage = sum(DamageCrops) by State
+| where State =~ "TEXAS" and EventType =~ "Flood"
+| top 50 by DamageProperty desc
+| project StartTime, State, EventType, DamageProperty
 
-User: "Find the worst storms (ignore those with missing event types)."
-KQL:
+# PATTERN 3: Aggregation by Category ("Total damage per state")
 StormEventsCopy
-| where isnotempty(EventType)
-| top 5 by DamageProperty desc
-
-User Goal: Get 10 recent storm events.
-KQL:
-StormEventsCopy
-| top 10 by StartTime desc
+| summarize TotalDamage = sum(DamageProperty) by State
+| top 10 by TotalDamage desc
 """
 
 def generate_kql(user_goal: str) -> str:
     """
     Takes a user intent and returns executable KQL code.
+    Includes Enterprise-grade sanitization and robust extraction.
     """
-    print(f"[QueryPlanner] Generating KQL for: {user_goal}")
+    logger.info(f"[QueryPlanner] Generating KQL for: {user_goal}")
 
     try:
         # We use a POST request to Ollama
@@ -87,54 +89,52 @@ def generate_kql(user_goal: str) -> str:
             },
             timeout=30  # Don't let the backend hang forever
         )
-
+        response.raise_for_status() # Raise error for HTTP 4xx/5xx
+        
         data = response.json()
         
-        # Safety check: ensure Ollama actually returned a message
-        if "message" not in data or "content" not in data["message"]:
-            print("[QueryPlanner] Error: Empty response from LLM")
+        raw_content = data.get("message", {}).get("content", "").strip()
+        
+        if not raw_content:
+            logger.warning("[QueryPlanner] LLM returned empty content.")
             return ""
 
-        kql = data["message"]["content"].strip()
-
-        # ---------------------------------------------------------
-        # POST-PROCESSING / SANITIZATION
-        # LLMs often add markdown blocks (```kql ... ```) even if told not to.
-        # We must strip these out so the database doesn't crash.
-        # ---------------------------------------------------------
+        return sanitize_kql_output(raw_content)
         
-        # Remove ```kql at the start
-        kql = kql.replace("```kql", "")
-        # Remove generic code blocks ```
-        kql = kql.replace("```", "")
-        # Remove leading/trailing whitespace
-        kql = kql.strip()
-
-        # Final sanity check: Ensure it starts with the table name
-        if not kql.startswith("StormEventsCopy"):
-            # If the LLM forgot the table name, we force-prepend it
-            # assuming the LLM generated just the filter part (e.g., "| where...")
-            if kql.startswith("|"):
-                kql = "StormEventsCopy\n" + kql
-            else:
-                # If it's completely malformed, we reject it to be safe
-                print(f"[QueryPlanner] Invalid KQL generated: {kql}")
-                return ""
-
-        return kql
-
     except Exception as e:
-        print(f"[QueryPlanner Error] {str(e)}")
-        return ""
+        logger.error(f"[QueryPlanner Error] {str(e)}")
+        return "" # Or re-raise depending on your API needs
+    
+def sanitize_kql_output(raw_text: str) -> str:
+    """
+    Extracts valid KQL from LLM noise.
+    Handles: Markdown blocks, 'Here is the query' text, and 'let' statements.
+    """
+    # 1. Clean Markdown backticks immediately
+    clean_text = raw_text.replace("```kql", "").replace("```", "").strip()
 
-# --------------------------------------------------
-# LOCAL TESTING BLOCK
-# This allows you to run `python backend/query_planner.py` directly
-# to test if queries are generating correctly without running the full app.
-# --------------------------------------------------
-if __name__ == "__main__":
-    print("=== QUERY PLANNER TEST MODE ===")
-    test_q = "Filter State equals 'OHIO' and sort by DamageProperty descending"
-    print(f"Input: {test_q}")
-    print("Result:")
-    print(generate_kql(test_q))
+    # 2. Regex Strategy
+    # Look for 'StormEventsCopy' OR 'let' (for variable declarations)
+    # This prevents stripping valid variable definitions at the start.
+    pattern = r"((?:let\s+.+?;\s*)?StormEventsCopy.*)"
+    
+    match = re.search(pattern, clean_text, re.DOTALL | re.IGNORECASE)
+    
+    if match:
+        kql = match.group(1).strip()
+    else:
+        # Fallback: Use the whole text if it looks vaguely like the table query
+        # This handles cases where LLM might alias the table: "T | ..." (Rare but possible)
+        kql = clean_text
+
+    # 3. Final Integrity Check
+    # We check if the table name exists strictly to avoid hallucinations
+    if "StormEventsCopy" not in kql:
+        # Auto-Correction: If it looks like a pipe chain, prepend the table
+        if kql.startswith("|"):
+            kql = "StormEventsCopy\n" + kql
+        else:
+            logger.error(f"[QueryPlanner] Invalid KQL generated: {kql}")
+            return ""
+
+    return kql

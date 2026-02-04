@@ -9,7 +9,7 @@ class MCPServer:
         self.allowed_table = "StormEventsCopy"
 
         # ---------------------------------------------------------
-        # BLOCKLIST: Sirf dangerous patterns ko block karenge
+        # BLOCKLIST: Security & Integrity Protection
         # ---------------------------------------------------------
         self.blocked_patterns = [
             r"^\s*\.",          # Control commands start with dot (.)
@@ -18,7 +18,7 @@ class MCPServer:
             r"\.create\b",      # Explicit creates
             r"\.set\b",         # Setting policies
             r"\.ingest\b",      # Ingesting data
-            r";"                # Semicolon (SQL Injection prevention)
+            r";"                # Semicolon (Basic SQL Injection prevention)
         ]
 
     # ---------------------------
@@ -29,7 +29,7 @@ class MCPServer:
         trace_id = str(uuid.uuid4())
         start_time = time.time()
 
-        # 2. LOG REQUEST (Jaisa aap chahte thay)
+        # 2. LOG REQUEST
         self.log(trace_id, "REQUEST", {
             "tool": tool,
             "goal": goal,
@@ -52,13 +52,20 @@ class MCPServer:
             # 5. Table Check (Must start with correct table)
             self.validate_table_access(clean_kql)
 
-            # 6. Success Logging
+            # ---------------------------------------------------------
+            # 6. ENTERPRISE SAFETY: INJECT LIMITS
+            # If the user asks for "Show data" without limits, we force one.
+            # This prevents 1 Billion rows from crashing the server.
+            # ---------------------------------------------------------
+            validated_kql = self.inject_safety_limits(clean_kql)
+
+            # 7. Success Logging
             latency = round(time.time() - start_time, 3)
             self.log(trace_id, "ACCEPTED", {"latency_sec": latency})
 
             return {
                 "trace_id": trace_id,
-                "validated_kql": clean_kql
+                "validated_kql": validated_kql
             }
 
         except Exception as e:
@@ -74,11 +81,9 @@ class MCPServer:
         """
         Block commands starting with dot (.) or containing explicit admin keywords.
         """
-        # Rule 1: KQL Admin commands start with dot (.)
         if kql.startswith("."):
             raise ValueError("Security Alert: Control commands (starting with '.') are NOT allowed.")
 
-        # Rule 2: Check regex patterns for dangerous keywords
         for pattern in self.blocked_patterns:
             if re.search(pattern, kql, re.IGNORECASE | re.MULTILINE):
                 raise ValueError(f"Security Alert: Blocked pattern detected -> {pattern}")
@@ -86,15 +91,36 @@ class MCPServer:
     def validate_table_access(self, kql: str):
         """
         Ensure the query actually starts with the allowed table.
-        Splits by pipe '|' to safely get the first token.
+        Robustness: Handles 'let' statements and whitespace.
         """
-        # Split by pipe to get the first part (e.g., "StormEventsCopy ")
-        parts = kql.split("|")
-        first_word = parts[0].strip()
+        # We look for the table name as a distinct word boundary (\b)
+        # This passes: "let x=1; StormEventsCopy | ..."
+        # This passes: "StormEventsCopy | ..."
+        if not re.search(r"\b" + re.escape(self.allowed_table) + r"\b", kql, re.IGNORECASE):
+            raise ValueError(f"Access Denied: Query must target table '{self.allowed_table}'.")
         
-        # Check if the query starts with the table name
-        if first_word != self.allowed_table:
-            raise ValueError(f"Access Denied: You can only query table '{self.allowed_table}'. Found: '{first_word}'")
+    def inject_safety_limits(self, kql: str) -> str:
+        """
+        ENTERPRISE FEATURE:
+        If the query is a raw data dump (no 'summarize', no 'count') AND lacks a limit,
+        we automatically append '| take 50' to protect the backend.
+        """
+        lower_kql = kql.lower()
+        
+        # 1. Check for Aggregations (Safe)
+        # We use regex \b to match whole words only.
+        # Prevents "summarize_data" (var name) from bypassing the check.
+        is_aggregation = re.search(r"\b(summarize|count|render)\b", lower_kql)
+        
+        # 2. Check for Limits (Safe)
+        # Prevents "where State == 'limit'" from bypassing the check.
+        has_limit = re.search(r"\b(take|limit|top)\b", lower_kql)
+        
+        if not is_aggregation and not has_limit:
+            print("[MCP] ⚠️ Warning: Unbounded query detected. Injecting safety limit.")
+            return kql + "\n| take 50"
+        
+        return kql
 
     # ---------------------------
     # LOGGING

@@ -1,6 +1,12 @@
 # backend/adx_client.py
 from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
-from backend.config import ADX_CLUSTER_URL, ADX_DATABASE, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID
+from backend.config import (
+    ADX_CLUSTER_URL,
+    ADX_DATABASE,
+    AZURE_CLIENT_ID,
+    AZURE_CLIENT_SECRET,
+    AZURE_TENANT_ID
+)
 
 # Use Service Principal if keys exist in .env, otherwise fallback to Device Login
 if AZURE_CLIENT_ID and AZURE_CLIENT_SECRET and AZURE_TENANT_ID:
