@@ -7,7 +7,6 @@ from backend.adx_client import run_kql
 from backend.mcp_server import MCPServer
 from backend.formatter import format_response
 from backend.chat_llm import chat_llm
-
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="LLM + ADX + MCP Backend")
@@ -27,8 +26,12 @@ def chat(req: ChatRequest):
     user_message = req.message.strip()
 
     # -----------------------
-    # Step 1: Orchestrator
+    # Step 1: Orchestrator (The Router)
     # -----------------------
+    # The Orchestrator decides if the user wants to:
+    # 1. Chat ("chat") -> Simple greeting
+    # 2. Query Data ("adx") -> Database interaction
+    # 3. Ask unrelated questions ("out_of_scope") -> Polite refusal
     decision = llm_decider(user_message)
 
     print(f"""
@@ -40,13 +43,13 @@ Query Goal : {decision.query_goal}
 """)
 
     # -----------------------
-    # CHAT (greetings only)
+    # PATH A: Simple Chat (Greetings)
     # -----------------------
     if decision.tool == "chat":
         return {"reply": chat_llm(user_message)}
 
     # -----------------------
-    # OUT OF SCOPE (NO FORMATTER)
+    # PATH B: Out of Scope
     # -----------------------
     if decision.tool == "out_of_scope":
         return {
@@ -58,87 +61,111 @@ Query Goal : {decision.query_goal}
         }
 
     # -----------------------
-    # ADX PATH
+    # PATH C: ADX Database Query (Enterprise Self-Healing)
     # -----------------------
     if decision.tool == "adx":
-        # Guard: empty goal
+        # Guard: Check if the Orchestrator failed to extract a goal
         if not decision.query_goal.strip():
             return {
                 "reply": "I couldn't understand a clear data request. Please rephrase your question."
             }
+        # =========================================================
+        # 🔄 SELF-HEALING LOOP
+        # Instead of trying once and failing, we try up to 3 times.
+        # If an error occurs, we feed the error back to the LLM to fix it.
+        # =========================================================
+        MAX_RETRIES = 2
+        attempt = 0
+        last_error = None
+        while attempt <= MAX_RETRIES:
+            try:
+                # -----------------------
+                # Step 2: Query Generation
+                # -----------------------
+                # If attempt == 0: Generates fresh KQL from user goal.
+                # If attempt > 0 : Uses 'Repair Mode' to fix the 'last_error'.
+                kql = generate_kql(decision.query_goal,retry_count=attempt,last_error=last_error)
 
-        try:
-            # Step 2: Query planner
-            kql = generate_kql(decision.query_goal)
+                if not kql:
+                    # If LLM returns nothing, force a retry with a generic error
+                    raise ValueError("LLM generated empty or invalid KQL syntax.")
 
-            if not kql:
-                return {
-                    "reply": "I couldn't generate a valid query for this request. Please rephrase it more clearly."
-                }
-
-            # Step 3: MCP validation
-            mcp_result = mcp.process(
-                tool="adx",
-                kql=kql,
-                goal=decision.query_goal
-            )
-            validated_kql = mcp_result["validated_kql"]
-
-            # Step 4: ADX execution
-            data = run_kql(validated_kql)
-
-            # Guard: no data
-            if not data:
-                return {
-                    "reply": "No data was found for your request."
-                }
-
-            # =========================================================
-            # ✅ CRITICAL FIX 1: Convert DateTime objects to Strings
-            # JSON cannot serialize datetime objects, so we convert them here.
-            # =========================================================
-            safe_data = []
-            for row in data:
-                clean_row = {}
-                for key, value in row.items():
-                    # Check if the value is a Date/Time object and convert it
-                    if hasattr(value, 'isoformat'):
-                        clean_row[key] = value.isoformat()
-                    else:
-                        clean_row[key] = value
-                safe_data.append(clean_row)
-
-            # =========================================================
-            # ✅ CRITICAL FIX 2: Prevent LLM Context Overflow
-            # We only send the top 15 rows to the AI for explanation.
-            # This prevents the "Context Window Exceeded" crash.
-            # =========================================================
-            MAX_ROWS_FOR_LLM = 15
-            preview_data = safe_data[:MAX_ROWS_FOR_LLM]
-
-            system_result = {
-                "total_rows_found": len(safe_data),
-                "rows_shown_to_ai": len(preview_data),
-                "data_sample": preview_data,
-                "note": "Data truncated for performance" if len(safe_data) > MAX_ROWS_FOR_LLM else "Full data shown"
-            }
-
-            final_answer = format_response(user_message, system_result)
-            return {"reply": final_answer}
-
-        except Exception as e:
-            # ❌ PRINT ERROR so you can see it in terminal
-            print(f"[ADX PROCESSING ERROR]: {str(e)}")
-            return {
-                "reply": (
-                    "I couldn't retrieve the data right now due to a system issue. "
-                    "Please try again later."
+                # -----------------------
+                # Step 3: MCP Validation (Guardrails)
+                # -----------------------
+                # Checks for security risks (e.g., .drop table) or missing limits.
+                # If unsafe, it raises ValueError, which triggers the retry loop.
+                mcp_result = mcp.process(
+                    tool="adx",
+                    kql=kql,
+                    goal=decision.query_goal
                 )
-            }
+                validated_kql = mcp_result["validated_kql"]
 
-    # -----------------------
-    # HARD SAFETY FALLBACK
-    # -----------------------
-    return {
-        "reply": "Sorry, I couldn't process your request."
-    }
+                # -----------------------
+                # Step 4: ADX Execution
+                # -----------------------
+                # Runs the query against Azure.
+                # - Raises ValueError for semantic errors (e.g., "Invalid column") -> Retries
+                # - Raises ConnectionError for network issues -> Stops loop
+                data = run_kql(validated_kql)
+
+                # Guard: no data
+                if not data:
+                    return {
+                        "reply": "No data was found for your request."
+                    }
+                # --- SUCCESS ---
+                # If we reach here, the query worked! We can break the loop.
+                
+                # -----------------------
+                # Step 5: Data Formatting
+                # -----------------------
+                # We truncate data to 15 rows to prevent crashing the LLM context window
+                MAX_ROWS_FOR_LLM = 15
+                
+                
+                # Note: ADX Client already handles datetime serialization
+                preview_data = data[:MAX_ROWS_FOR_LLM]
+                
+                system_result = {
+                    "total_rows_found": len(data),
+                    "rows_shown_to_ai": len(preview_data),
+                    "data_sample": preview_data,
+                    "note": "Data truncated for performance" if len(data) > MAX_ROWS_FOR_LLM else "Full data shown"
+                }
+
+                # Use the LLM to explain the data to the user
+                final_answer = format_response(user_message, system_result)
+                return {"reply": final_answer}
+
+            except Exception as e:
+                # -----------------------
+                # RECOVERABLE ERROR (Logic/Syntax)
+                # -----------------------
+                # Caught: Semantic Errors (e.g., "Invalid bin size") OR MCP Blocks.
+                # We save the error and loop back to let the LLM fix it
+                last_error = str(e)
+                print(f"⚠️ [Self-Healing] Attempt {attempt+1} Failed: {last_error}")
+                attempt += 1
+                
+            except Exception as e:
+                # -----------------------
+                # FATAL ERROR (System)
+                # -----------------------
+                # Caught: Network/Auth Errors. The LLM cannot fix these.
+                print(f"❌ [System Error] {str(e)}")
+                return {"reply": "I encountered a system error connecting to the database."}
+
+
+        # -----------------------
+        # FAILURE (Loop Exhausted)
+        # -----------------------
+        # If we exit the while loop, it means we tried 3 times (0, 1, 2) and failed every time.
+        return {
+            "reply": (
+                "I tried to run the query multiple times, but I kept encountering technical errors. "
+                "Please try rephrasing your request."
+            )
+        }
+    

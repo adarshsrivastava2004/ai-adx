@@ -40,7 +40,10 @@ Columns:
 - **Massive Data Policy:**
   - If the user implies "All data" or "Trends" without filters -> Generate a `summarize count() by bin(StartTime, ...)` query.
   - **NEVER** use `take` or `limit` on broad analytical queries; use aggregations instead.
-
+- **Duration Math:**
+  - KQL does NOT have `DATEDIFF`. 
+  - To calculate duration in minutes: `(EndTime - StartTime) / 1m`.
+  - To calculate duration in days: `(EndTime - StartTime) / 1d`.
 # 3. STRATEGY PATTERNS
 
 # PATTERN 1: Broad/Massive Request ("Show me all events", "Total data", "Timeline")
@@ -61,46 +64,75 @@ StormEventsCopy
 | top 10 by TotalDamage desc
 """
 
-def generate_kql(user_goal: str) -> str:
+def generate_kql(user_goal: str, retry_count: int = 0, last_error: str = None) -> str:
     """
-    Takes a user intent and returns executable KQL code.
-    Includes Enterprise-grade sanitization and robust extraction.
+    Generates KQL, with AUTOMATIC SELF-HEALING if a previous attempt failed.
+    Args:
+        user_goal (str): The user's original natural language request.
+        retry_count (int): 
+            - 0: Initial attempt (Standard Translation).
+            - 1+: Retry attempt (Repair Mode).
+        last_error (str): The specific error message from the database/compiler 
+                          that caused the previous failure.
     """
-    logger.info(f"[QueryPlanner] Generating KQL for: {user_goal}")
+    
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    
+    # ---------------------------------------------------------
+    # MODE 1: STANDARD GENERATION (First Attempt)
+    # ---------------------------------------------------------
+    # If this is the first time we are seeing this request, we just 
+    # ask the LLM to translate the user's goal into KQL.
+    if retry_count == 0:
+        messages.append({"role": "user", "content": user_goal})
+        logger.info(f"[QueryPlanner] Generating initial KQL for: {user_goal}")
+        
+    
+    # ---------------------------------------------------------
+    # MODE 2: REPAIR GENERATION (Self-Healing)
+    # ---------------------------------------------------------
+    # If we are retrying, it means the previous query failed.
+    # Instead of asking the same question again (which would likely yield the same wrong answer),
+    # we show the LLM the error message and ask it to debug its own code.
+    else:
+        logger.warning(f"[QueryPlanner] 🚑 Attempting Repair (Try #{retry_count}). Error: {last_error}")
+        
+        # We explicitly instruct the LLM to look at the error and fix the logic
+        repair_prompt = f"""
+        USER GOAL: {user_goal}
+        
+        PREVIOUS ATTEMPT FAILED.
+        ERROR MESSAGE: {last_error}
+        
+        TASK: Fix the KQL query to resolve this specific error.
+        - If the error is 'invalid data type', check your aggregations (bin/summarize).
+        - If the error is 'syntax', check for missing pipes or brackets.
+        - If the error is 'limit injected', rewrite the query to use 'summarize' instead of 'take'.
+        - Output ONLY the fixed KQL.
+        """
+        messages.append({"role": "user", "content": repair_prompt})
 
     try:
-        # We use a POST request to Ollama
         response = requests.post(
             OLLAMA_CHAT_URL,
             json={
                 "model": MODEL,
-                "messages": [
-                    # The System Prompt sets the rules and schema
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    # The User message is the specific request from the Orchestrator
-                    {"role": "user", "content": user_goal}
-                ],
+                "messages": messages,
                 "stream": False,
-                "options": {
-                    # Temperature 0.1 makes the model very "boring" and precise.
-                    # We don't want creativity in code generation; we want accuracy.
-                    "temperature": 0.1
-                }
+                "options": {"temperature": 0.1} # Strict precision
             },
-            timeout=30  # Don't let the backend hang forever
+            timeout=30
         )
-        response.raise_for_status() # Raise error for HTTP 4xx/5xx
+        response.raise_for_status()
         
         data = response.json()
-        
         raw_content = data.get("message", {}).get("content", "").strip()
         
         if not raw_content:
-            logger.warning("[QueryPlanner] LLM returned empty content.")
             return ""
 
         return sanitize_kql_output(raw_content)
-        
+         
     except Exception as e:
         logger.error(f"[QueryPlanner Error] {str(e)}")
         return "" # Or re-raise depending on your API needs
@@ -108,7 +140,6 @@ def generate_kql(user_goal: str) -> str:
 def sanitize_kql_output(raw_text: str) -> str:
     """
     Extracts valid KQL from LLM noise.
-    Handles: Markdown blocks, 'Here is the query' text, and 'let' statements.
     """
     # 1. Clean Markdown backticks immediately
     clean_text = raw_text.replace("```kql", "").replace("```", "").strip()
@@ -117,7 +148,6 @@ def sanitize_kql_output(raw_text: str) -> str:
     # Look for 'StormEventsCopy' OR 'let' (for variable declarations)
     # This prevents stripping valid variable definitions at the start.
     pattern = r"((?:let\s+.+?;\s*)?StormEventsCopy.*)"
-    
     match = re.search(pattern, clean_text, re.DOTALL | re.IGNORECASE)
     
     if match:
