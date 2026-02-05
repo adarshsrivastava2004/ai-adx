@@ -3,8 +3,16 @@
 import logging
 from typing import List, Dict, Any
 
-# We import specific Kusto exceptions to handle "Bad Queries" vs "Network Errors" differently
-from azure.kusto.data import KustoClient, KustoConnectionStringBuilder
+# ---------------------------------------------------------
+# FIXED IMPORTS
+# ---------------------------------------------------------
+# 1. Async Client comes from .aio
+from azure.kusto.data.aio import KustoClient
+
+# 2. Connection Builder is ALWAYS sync (it just builds a string)
+from azure.kusto.data import KustoConnectionStringBuilder
+
+# 3. Exceptions
 from azure.kusto.data.exceptions import KustoServiceError, KustoClientError
 
 from backend.config import (
@@ -44,7 +52,7 @@ class ADXManager:
         # This is "Lazy Loading". We won't connect until the first query runs.
         self._client = None
 
-    def _get_client(self) -> KustoClient:
+    async def _get_client(self) -> KustoClient:
         """
         Retrieves the existing client or creates a new one if it doesn't exist.
         Reason: Prevents the backend from crashing immediately on startup if 
@@ -70,13 +78,16 @@ class ADXManager:
             logger.critical(f"[AUTH FAILED] {str(e)}")
             raise ADXSystemError(f"Authentication Failed: {str(e)}")
 
-    def run_kql(self, query: str) -> List[Dict[str, Any]]:
+    async def run_kql(self, query: str) -> List[Dict[str, Any]]:
         """
         Executes a KQL query and returns a clean list of dictionaries.
         """
-        client = self._get_client()
+        # We await the client getter (good practice for async init patterns)
+        client = await self._get_client()
         try:
-            response = client.execute(ADX_DATABASE, query)
+            # ⚡ KEY CHANGE: 'await' the network call.
+            # This releases the server to help other users while waiting for data.
+            response = await client.execute(ADX_DATABASE, query)
             
             # Kusto returns multiple tables; we only want the first one (primary results)
             if not response.primary_results:
@@ -89,7 +100,7 @@ class ADXManager:
             return results
         
         # -------------------------------------------------------
-        # CRITICAL: Enterprise Error Sorting
+        # ERROR HANDLING (Same logic, just adapted for async flow)
         # -------------------------------------------------------
         except KustoServiceError as e:
             # Sometimes the SDK wraps network errors in KustoServiceError.
@@ -106,9 +117,9 @@ class ADXManager:
             ]
             
             if any(kw in error_str for kw in system_keywords):
-                 logger.error(f"[ADX System Error (Redirected)]: {e}")
-                 # Redirect to System Lane (Retry with Backoff)
-                 raise ADXSystemError(str(e))
+                logger.error(f"[ADX System Error (Redirected)]: {e}")
+                # Redirect to System Lane (Retry with Backoff)
+                raise ADXSystemError(str(e))
 
             # If no network keywords found, it is a genuine Logic/Syntax error.
             logger.warning(f"[ADX Logic Error]: {e}")
@@ -118,7 +129,11 @@ class ADXManager:
             # Catch-all for other crashes (DNS, Auth, etc.)
             logger.error(f"[ADX System Error]: {e}")
             raise ADXSystemError(str(e))
-
+    async def close(self):
+        """Cleanup: Close the async session when app shuts down"""
+        if self._client:
+            await self._client.close()
+            
     def _serialize(self, row: Dict) -> Dict:
         """
         Helper: Converts Python datetime objects to ISO strings (e.g., "2023-01-01").
@@ -136,5 +151,5 @@ class ADXManager:
 adx_manager = ADXManager()
 
 # Public function used by main.py
-def run_kql(query: str):
-    return adx_manager.run_kql(query)
+async def run_kql(query: str):
+    return await adx_manager.run_kql(query)

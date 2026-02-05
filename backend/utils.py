@@ -1,12 +1,12 @@
 # backend/utils.py
 
-import time
+import asyncio
 import logging
 from backend.adx_client import ADXSystemError
 
 logger = logging.getLogger(__name__)
 
-def execute_with_backoff(func, *args, max_retries=3, **kwargs):
+async def execute_with_backoff(func, *args, max_retries=3, **kwargs):
     """
     Executes a function with Exponential Backoff retry logic.
     
@@ -19,16 +19,19 @@ def execute_with_backoff(func, *args, max_retries=3, **kwargs):
     
     for attempt in range(max_retries + 1):
         try:
-            return func(*args, **kwargs)
+            # ⚡ Await the async function passed in (run_kql)
+            return await func(*args, **kwargs)
             
         except ADXSystemError as e:
             # This is a network glitch. We should retry.
             if attempt == max_retries:
                 logger.critical(f"❌ System unreachable after {max_retries} retries. Giving up.")
-                raise e 
+                raise e
             
             logger.warning(f"⚠️ Network/System glitch. Retrying in {delay}s... (Error: {e})")
-            time.sleep(delay)
+            # ⚡ NON-BLOCKING SLEEP
+            # This releases the CPU to handle other users!
+            await asyncio.sleep(delay)
             delay *= 2  # Double the wait time (1s -> 2s -> 4s)
             
         except Exception as e:

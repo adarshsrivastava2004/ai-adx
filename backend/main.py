@@ -23,7 +23,7 @@ app.add_middleware(
 mcp = MCPServer()
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     user_message = req.message.strip()
 
     # -----------------------
@@ -110,7 +110,8 @@ Query Goal : {decision.query_goal}
                 # Runs the query against Azure.
                 # - Raises ValueError for semantic errors (e.g., "Invalid column") -> Retries
                 # - Raises ConnectionError for network issues -> Stops loop
-                data = execute_with_backoff(run_kql, validated_kql)
+                # ⚡ AWAIT the async execution
+                data = await execute_with_backoff(run_kql, validated_kql)
 
                 # Guard: no data
                 if not data:
