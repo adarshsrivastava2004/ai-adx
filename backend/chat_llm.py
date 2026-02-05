@@ -38,7 +38,7 @@ User:
 """
 
         response = requests.post(
-            OLLAMA_URL,
+            OLLAMA_GENERATE_URL,
             json={
                 "model": MODEL,
                 "prompt": prompt,
