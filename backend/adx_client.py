@@ -17,6 +17,27 @@ from backend.config import (
 
 logger = logging.getLogger(__name__)
 
+# =========================================================
+# 1. DEFINE CUSTOM EXCEPTIONS (The "Traffic Signals")
+# =========================================================
+
+class ADXSemanticError(Exception):
+    """
+    Raised when the ERROR IS THE AI'S FAULT.
+    Examples: "Table not found", "Invalid Column", "Syntax Error".
+    Action: The Main Loop should catch this and ask the LLM to fix the query.
+    """
+    pass
+
+class ADXSystemError(Exception):
+    """
+    Raised when the ERROR IS THE INFRASTRUCTURE'S FAULT.
+    Examples: "Network Down", "Auth Token Expired", "DNS Failure".
+    Action: The System should retry with backoff (wait 1s, 2s, 4s). DO NOT wake the LLM.
+    """
+    pass
+logger = logging.getLogger(__name__)
+
 class ADXManager:
     def __init__(self):
         # We hold the client in a variable but START as None.
@@ -47,7 +68,7 @@ class ADXManager:
         except Exception as e:
             # Critical error: We cannot even create the client object.
             logger.critical(f"[AUTH FAILED] {str(e)}")
-            raise
+            raise ADXSystemError(f"Authentication Failed: {str(e)}")
 
     def run_kql(self, query: str) -> List[Dict[str, Any]]:
         """
@@ -68,18 +89,35 @@ class ADXManager:
             return results
         
         # -------------------------------------------------------
-        # CRITICAL: Error differentiation
+        # CRITICAL: Enterprise Error Sorting
         # -------------------------------------------------------
         except KustoServiceError as e:
-            # This catches "Semantic Errors" (e.g., "Table not found", "Invalid column").
-            # We raise ValueError so our App knows it was a logic error, not a system crash.
-            logger.error(f"[ADX Semantic Error]: {e}")
-            raise ValueError(str(e)) 
+            # Sometimes the SDK wraps network errors in KustoServiceError.
+            # We must look at the actual message to decide.
+            error_str = str(e).lower()
+            
+            # KEYWORDS THAT INDICATE IT IS ACTUALLY A SYSTEM ERROR:
+            system_keywords = [
+                "failed to process network request", 
+                "connection refused", 
+                "timeout", 
+                "max retries exceeded", 
+                "endpoint unreachable"
+            ]
+            
+            if any(kw in error_str for kw in system_keywords):
+                 logger.error(f"[ADX System Error (Redirected)]: {e}")
+                 # Redirect to System Lane (Retry with Backoff)
+                 raise ADXSystemError(str(e))
+
+            # If no network keywords found, it is a genuine Logic/Syntax error.
+            logger.warning(f"[ADX Logic Error]: {e}")
+            raise ADXSemanticError(str(e))
             
         except Exception as e:
-            # This catches "System Errors" (e.g., Network down, DNS failure).
+            # Catch-all for other crashes (DNS, Auth, etc.)
             logger.error(f"[ADX System Error]: {e}")
-            raise ConnectionError(str(e))
+            raise ADXSystemError(str(e))
 
     def _serialize(self, row: Dict) -> Dict:
         """

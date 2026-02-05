@@ -3,7 +3,8 @@ from fastapi import FastAPI
 from backend.schemas import ChatRequest
 from backend.orchestrator import llm_decider
 from backend.query_planner import generate_kql
-from backend.adx_client import run_kql
+from backend.adx_client import run_kql, ADXSemanticError
+from backend.utils import execute_with_backoff
 from backend.mcp_server import MCPServer
 from backend.formatter import format_response
 from backend.chat_llm import chat_llm
@@ -76,7 +77,7 @@ Query Goal : {decision.query_goal}
         # =========================================================
         MAX_RETRIES = 2
         attempt = 0
-        last_error = None
+        last_semantic_error = None
         while attempt <= MAX_RETRIES:
             try:
                 # -----------------------
@@ -84,7 +85,8 @@ Query Goal : {decision.query_goal}
                 # -----------------------
                 # If attempt == 0: Generates fresh KQL from user goal.
                 # If attempt > 0 : Uses 'Repair Mode' to fix the 'last_error'.
-                kql = generate_kql(decision.query_goal,retry_count=attempt,last_error=last_error)
+                print(f"🔹 [Attempt {attempt}] Generating KQL...")
+                kql = generate_kql(decision.query_goal,retry_count=attempt,last_error=last_semantic_error)
 
                 if not kql:
                     # If LLM returns nothing, force a retry with a generic error
@@ -108,7 +110,7 @@ Query Goal : {decision.query_goal}
                 # Runs the query against Azure.
                 # - Raises ValueError for semantic errors (e.g., "Invalid column") -> Retries
                 # - Raises ConnectionError for network issues -> Stops loop
-                data = run_kql(validated_kql)
+                data = execute_with_backoff(run_kql, validated_kql)
 
                 # Guard: no data
                 if not data:
@@ -139,22 +141,19 @@ Query Goal : {decision.query_goal}
                 final_answer = format_response(user_message, system_result)
                 return {"reply": final_answer}
 
-            except Exception as e:
-                # -----------------------
-                # RECOVERABLE ERROR (Logic/Syntax)
-                # -----------------------
-                # Caught: Semantic Errors (e.g., "Invalid bin size") OR MCP Blocks.
-                # We save the error and loop back to let the LLM fix it
-                last_error = str(e)
-                print(f"⚠️ [Self-Healing] Attempt {attempt+1} Failed: {last_error}")
+            except ADXSemanticError as e:
+                # 🧠 LANE 1 ERROR: AI MISTAKE
+                # The server responded "Invalid Column" or "Syntax Error".
+                # We catch this and loop back so the AI can fix it.
+                print(f"📉 [AI Logic Flaw] Attempt {attempt} failed: {e}")
+                last_semantic_error = str(e)
                 attempt += 1
                 
             except Exception as e:
-                # -----------------------
-                # FATAL ERROR (System)
-                # -----------------------
-                # Caught: Network/Auth Errors. The LLM cannot fix these.
-                print(f"❌ [System Error] {str(e)}")
+                # 🛑 LANE 2 ERROR: CRITICAL FAILURE
+                # If we get here, it means 'execute_with_backoff' gave up after 3 network retries.
+                # The AI cannot fix a down server. Stop the loop.
+                print(f"❌ [Critical System Failure] {str(e)}")
                 return {"reply": "I encountered a system error connecting to the database."}
 
 
