@@ -1,9 +1,13 @@
 # backend/orchestrator.py
 
 import requests
+import logging
 import json
 from backend.schemas import ToolDecision
 from backend.config import OLLAMA_CHAT_URL, MODEL
+
+# 2. Setup Logger
+logger = logging.getLogger(__name__)
 
 # NOTE: Switched to /api/chat for better structured output support
 
@@ -125,14 +129,14 @@ def llm_decider(user_input: str) -> ToolDecision:
 
         # 🔒 SAFETY: Check for API errors or missing content
         if "message" not in data or "content" not in data["message"]:
-            print("[ORCHESTRATOR] Missing response from LLM")
+            logger.error("❌ [ORCHESTRATOR] Missing response from LLM")
             return ToolDecision(tool="out_of_scope", query_goal="")
 
         # The content is guaranteed to be a JSON string due to the schema
         raw_text = data["message"]["content"]
 
-        # Debug (dev only)
-        print(f"\n[LLM RAW OUTPUT]: {raw_text}")
+        # Debug log (Hidden by default in INFO mode, visible in DEBUG mode)
+        logger.debug(f"[LLM RAW OUTPUT]: {raw_text}")
 
         parsed = json.loads(raw_text)
 
@@ -143,5 +147,5 @@ def llm_decider(user_input: str) -> ToolDecision:
 
     except Exception as e:
         # 🔒 HARD FAILSAFE
-        print(f"[ORCHESTRATOR ERROR]: {str(e)}")
+        logger.error(f"❌ [ORCHESTRATOR ERROR]: {str(e)}", exc_info=True)
         return ToolDecision(tool="out_of_scope", query_goal="")

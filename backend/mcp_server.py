@@ -3,6 +3,9 @@ import re
 import uuid
 import time
 from typing import Dict
+import logging
+
+logger = logging.getLogger(__name__)
 
 class MCPServer:
     def __init__(self):
@@ -29,8 +32,9 @@ class MCPServer:
         trace_id = str(uuid.uuid4())
         start_time = time.time()
 
+        
         # 2. LOG REQUEST
-        self.log(trace_id, "REQUEST", {
+        self._log_event(trace_id, "REQUEST", {
             "tool": tool,
             "goal": goal,
             "kql": kql
@@ -61,7 +65,7 @@ class MCPServer:
 
             # 7. Success Logging
             latency = round(time.time() - start_time, 3)
-            self.log(trace_id, "ACCEPTED", {"latency_sec": latency})
+            self._log_event(trace_id, "ACCEPTED", {"latency_sec": latency})
 
             return {
                 "trace_id": trace_id,
@@ -71,7 +75,7 @@ class MCPServer:
         except Exception as e:
             # Error Logging
             latency = round(time.time() - start_time, 3)
-            self.log(trace_id, "BLOCKED", {"error": str(e), "latency_sec": latency})
+            self._log_event(trace_id, "BLOCKED", {"error": str(e), "latency_sec": latency})
             raise e
 
     # ---------------------------
@@ -117,15 +121,21 @@ class MCPServer:
         has_limit = re.search(r"\b(take|limit|top)\b", lower_kql)
         
         if not is_aggregation and not has_limit:
-            print("[MCP] ⚠️ Warning: Unbounded query detected. Injecting safety limit.")
+            logger.warning("[MCP] ⚠️ Unbounded query detected. Injecting safety limit.")
             return kql + "\n| take 50"
         
         return kql
 
     # ---------------------------
-    # LOGGING
+    # LOGGING HELPER
     # ---------------------------
-    def log(self, trace_id: str, stage: str, data: Dict):
-        print(f"\n[MCP] trace_id={trace_id}")
-        print(f"[MCP] stage={stage}")
-        print(f"[MCP] data={data}")
+    def _log_event(self, trace_id: str, stage: str, data: Dict):
+        """
+        Internal helper to route logs to the correct level (INFO vs ERROR).
+        """
+        msg = f"[MCP] trace_id={trace_id} | stage={stage} | data={data}"
+        
+        if stage == "BLOCKED":
+            logger.error(msg)
+        else:
+            logger.info(msg)

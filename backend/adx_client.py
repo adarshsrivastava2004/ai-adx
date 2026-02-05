@@ -44,7 +44,11 @@ class ADXSystemError(Exception):
     Action: The System should retry with backoff (wait 1s, 2s, 4s). DO NOT wake the LLM.
     """
     pass
-logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# 2. MANAGER CLASS
+# =========================================================
 
 class ADXManager:
     def __init__(self):

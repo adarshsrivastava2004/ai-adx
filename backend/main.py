@@ -10,6 +10,9 @@ from backend.formatter import format_response
 from backend.chat_llm import chat_llm
 from fastapi.middleware.cors import CORSMiddleware
 
+import logging
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="LLM + ADX + MCP Backend")
 
 app.add_middleware(
@@ -19,6 +22,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 mcp = MCPServer()
 
@@ -35,13 +40,14 @@ async def chat(req: ChatRequest):
     # 3. Ask unrelated questions ("out_of_scope") -> Polite refusal
     decision = llm_decider(user_message)
 
-    print(f"""
-================ ROUTER DECISION ================
-User Query : {user_message}
-Tool       : {decision.tool}
-Query Goal : {decision.query_goal}
-================================================
-""")
+    # ✅ LOGGING: Router Decision
+    logger.info(
+        f"\n================ ROUTER DECISION ================\n"
+        f"User Query : {user_message}\n"
+        f"Tool       : {decision.tool}\n"
+        f"Query Goal : {decision.query_goal}\n"
+        f"================================================"
+    )
 
     # -----------------------
     # PATH A: Simple Chat (Greetings)
@@ -67,6 +73,7 @@ Query Goal : {decision.query_goal}
     if decision.tool == "adx":
         # Guard: Check if the Orchestrator failed to extract a goal
         if not decision.query_goal.strip():
+            logger.warning("⚠️ Orchestrator selected ADX but returned empty goal.")
             return {
                 "reply": "I couldn't understand a clear data request. Please rephrase your question."
             }
@@ -85,7 +92,8 @@ Query Goal : {decision.query_goal}
                 # -----------------------
                 # If attempt == 0: Generates fresh KQL from user goal.
                 # If attempt > 0 : Uses 'Repair Mode' to fix the 'last_error'.
-                print(f"🔹 [Attempt {attempt}] Generating KQL...")
+                logger.info(f"🔹 [Attempt {attempt}] Generating KQL...")
+                
                 kql = generate_kql(decision.query_goal,retry_count=attempt,last_error=last_semantic_error)
 
                 if not kql:
@@ -102,6 +110,7 @@ Query Goal : {decision.query_goal}
                     kql=kql,
                     goal=decision.query_goal
                 )
+                
                 validated_kql = mcp_result["validated_kql"]
 
                 # -----------------------
@@ -115,6 +124,7 @@ Query Goal : {decision.query_goal}
 
                 # Guard: no data
                 if not data:
+                    logger.info("✅ Query successful but returned 0 rows.")
                     return {
                         "reply": "No data was found for your request."
                     }
@@ -126,8 +136,6 @@ Query Goal : {decision.query_goal}
                 # -----------------------
                 # We truncate data to 15 rows to prevent crashing the LLM context window
                 MAX_ROWS_FOR_LLM = 15
-                
-                
                 # Note: ADX Client already handles datetime serialization
                 preview_data = data[:MAX_ROWS_FOR_LLM]
                 
@@ -138,6 +146,7 @@ Query Goal : {decision.query_goal}
                     "note": "Data truncated for performance" if len(data) > MAX_ROWS_FOR_LLM else "Full data shown"
                 }
 
+                logger.info(f"✅ Data retrieved: {len(data)} rows found.")
                 # Use the LLM to explain the data to the user
                 final_answer = format_response(user_message, system_result)
                 return {"reply": final_answer}
@@ -146,7 +155,7 @@ Query Goal : {decision.query_goal}
                 # 🧠 LANE 1 ERROR: AI MISTAKE
                 # The server responded "Invalid Column" or "Syntax Error".
                 # We catch this and loop back so the AI can fix it.
-                print(f"📉 [AI Logic Flaw] Attempt {attempt} failed: {e}")
+                logger.warning(f"📉 [AI Logic Flaw] Attempt {attempt} failed: {e}")
                 last_semantic_error = str(e)
                 attempt += 1
                 
@@ -154,7 +163,7 @@ Query Goal : {decision.query_goal}
                 # 🛑 LANE 2 ERROR: CRITICAL FAILURE
                 # If we get here, it means 'execute_with_backoff' gave up after 3 network retries.
                 # The AI cannot fix a down server. Stop the loop.
-                print(f"❌ [Critical System Failure] {str(e)}")
+                logger.error(f"❌ [Critical System Failure] {str(e)}", exc_info=True)
                 return {"reply": "I encountered a system error connecting to the database."}
 
 
@@ -162,6 +171,7 @@ Query Goal : {decision.query_goal}
         # FAILURE (Loop Exhausted)
         # -----------------------
         # If we exit the while loop, it means we tried 3 times (0, 1, 2) and failed every time.
+        logger.error(f"❌ All {MAX_RETRIES + 1} attempts failed. Giving up.")
         return {
             "reply": (
                 "I tried to run the query multiple times, but I kept encountering technical errors. "

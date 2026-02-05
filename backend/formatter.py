@@ -4,10 +4,12 @@
 # - Formatter strictly follows read-only, explanation-only behavior
 
 import json
+import logging
 import requests
 import traceback
 from backend.config import OLLAMA_GENERATE_URL, MODEL
 
+logger = logging.getLogger(__name__)
 
 FORMATTER_SYSTEM_PROMPT = """
 ### SYSTEM INSTRUCTION
@@ -74,8 +76,6 @@ Output:
 """
 
 
-
-
 def format_response(user_query: str, system_json: dict) -> str:
     """
     FIXED & SAFE FORMATTER
@@ -121,12 +121,7 @@ Generate the best possible answer for the user.
         # ==================================================
         # ✅ DEBUG PRINT: Show me the error in the terminal!
         # ==================================================
-        print("\n" + "="*40)
-        print("❌ FORMATTER CRASHED")
-        print(f"Error: {str(e)}")
-        print("Traceback:")
-        print(traceback.format_exc())
-        print("="*40 + "\n")
+        logger.error(f"❌ FORMATTER CRASHED: {str(e)}", exc_info=True)
         return (
             "Sorry, I’m unable to generate a response right now. "
             "Please try again in a moment."

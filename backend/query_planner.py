@@ -69,11 +69,10 @@ def generate_kql(user_goal: str, retry_count: int = 0, last_error: str = None) -
     Generates KQL, with AUTOMATIC SELF-HEALING if a previous attempt failed.
     Args:
         user_goal (str): The user's original natural language request.
-        retry_count (int): 
+        retry_count (int):
             - 0: Initial attempt (Standard Translation).
             - 1+: Retry attempt (Repair Mode).
-        last_error (str): The specific error message from the database/compiler 
-                          that caused the previous failure.
+        last_error (str): The specific error message from the database/compiler that caused the previous failure.
     """
     
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -129,12 +128,13 @@ def generate_kql(user_goal: str, retry_count: int = 0, last_error: str = None) -
         raw_content = data.get("message", {}).get("content", "").strip()
         
         if not raw_content:
+            logger.error("[QueryPlanner] LLM returned empty content.")
             return ""
 
         return sanitize_kql_output(raw_content)
          
     except Exception as e:
-        logger.error(f"[QueryPlanner Error] {str(e)}")
+        logger.error(f"[QueryPlanner Error] {str(e)}", exc_info=True)
         return "" # Or re-raise depending on your API needs
     
 def sanitize_kql_output(raw_text: str) -> str:

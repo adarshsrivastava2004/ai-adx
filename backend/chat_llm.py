@@ -5,8 +5,10 @@
 # - No DB, no JSON, no formatter logic here
 
 import requests
+import logging  # 1. Import logging
 from backend.config import OLLAMA_GENERATE_URL, MODEL
 
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
 You are a friendly conversational assistant.
@@ -49,6 +51,9 @@ User:
 
         return response.json()["response"].strip()
 
-    except Exception:
+    except Exception as e:
+        # 3. Log the error (Vital for debugging timeouts/crashes)
+        logger.error(f"⚠️ Chat LLM Failed (Ollama down?): {str(e)}")
+        
         # FIX: Prevent backend crash if Ollama is down
         return "Hi! I'm here to help 😊"
