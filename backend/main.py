@@ -13,6 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 logger = logging.getLogger(__name__)
 
+
+# 👇 IMPORT THE NEW CONFIG
+from backend.logging_config import setup_logging
+
+# 1. Setup Logging (First thing that happens!)
+setup_logging()
 app = FastAPI(title="LLM + ADX + MCP Backend")
 
 app.add_middleware(
