@@ -34,6 +34,10 @@ Columns:
 - **Performance First:** Put time filters (e.g., `where StartTime > ...`) immediately after the table name whenever a time context is implied.
 - **Time Handling:** - NEVER use `format_datetime` inside a `summarize` or `bin` function.
   - ALWAYS use `bin(StartTime, 1d)` directly on the raw datetime column.
+  - **Date Casting (CRITICAL):** KQL is strict types. You **MUST** cast date strings.
+    - WRONG: `where StartTime >= "2023-01-01"` (This causes type error)
+    - RIGHT: `where StartTime >= datetime("2023-01-01")`
+  - **Date Functions:** `year()` is NOT valid KQL. Use `getyear(StartTime)`.
 - **INVALID UNITS:** `1y`, `1mo` are NOT valid KQL.
 - **VALID UNITS:** Use `365d` for years, `30d` for months, `1d` for days, `1h` for hours.
   - Example: Use `bin(StartTime, 365d)` instead of `bin(StartTime, 1y)`.
@@ -41,7 +45,7 @@ Columns:
   - If the user implies "All data" or "Trends" without filters -> Generate a `summarize count() by bin(StartTime, ...)` query.
   - **NEVER** use `take` or `limit` on broad analytical queries; use aggregations instead.
 - **Duration Math:**
-  - KQL does NOT have `DATEDIFF`. 
+  - KQL does NOT have `DATEDIFF`.
   - To calculate duration in minutes: `(EndTime - StartTime) / 1m`.
   - To calculate duration in days: `(EndTime - StartTime) / 1d`.
 # 3. STRATEGY PATTERNS
@@ -62,6 +66,13 @@ StormEventsCopy
 StormEventsCopy
 | summarize TotalDamage = sum(DamageProperty) by State
 | top 10 by TotalDamage desc
+
+# PATTERN 4: Specific Time Filtering ("Events in 2007" or "July 2023")
+StormEventsCopy
+| where getyear(StartTime) == 2007
+// OR for specific range:
+// | where StartTime >= datetime("2023-07-01") and StartTime < datetime("2023-08-01")
+| summarize count() by EventType
 """
 
 def generate_kql(user_goal: str, retry_count: int = 0, last_error: str = None) -> str:
