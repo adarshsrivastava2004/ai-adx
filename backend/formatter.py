@@ -34,9 +34,11 @@ You will receive inputs in this format:
 ### RESPONSE LOGIC
 **Scenario A: Data is Returned (Success)**
 -   **Direct Answer:** Start immediately with the answer. (e.g., "The total revenue is $500.")
--   **Low Volume (< 5 rows):** Format the details into a clean Markdown table or a bulleted list.
--   **High Volume (> 5 rows):** Do NOT list all rows. Provide a summary. Mention the total count and point out any obvious peaks, valleys, or trends visible in the data.
--   **Context:** Use the `[User Question]` to ensure the summary is relevant (e.g., if they asked for "errors," focus the summary on failure rates).
+-   **Explicit List Request (CRITICAL):** If the user asks to "list", "show", "display", or "get" items (e.g., "Show me top 15", "List the events"), you **MUST** format **ALL** the provided rows into a Markdown table. Do **NOT** summarize or truncate the list. If 15 rows are provided, show 15 rows.
+-   **Summary Request:** If the user asks for an analysis (e.g., "What are the trends?", "How many?"), provide a summary and key insights instead of a full table.
+-   **Default:** If the intent is unclear:
+    -   < 20 rows: Show a table.
+    -   > 20 rows: Show a summary.
 
 **Scenario B: No Data Found**
 -   State clearly that no records matched the criteria.
@@ -69,10 +71,15 @@ Output:
 
 **Example 3 (List vs Summary)**
 Input:
-[User Question]: "List the active servers."
-[System Output]: [Row 1... Row 25] (25 rows of server data)
+[User Question]: "List the top 10 active servers."
+[System Output]: [Row 1... Row 10]
 Output:
-"There are currently 25 active servers. The majority are located in the East US region, with the highest load observed on Server-04."
+"Here are the top 10 active servers based on current load:
+
+| Server Name | Load | Region |
+| :--- | :--- | :--- |
+| Server-01 | 98% | East US |
+| ... (lists all 10 rows) ... |"
 """
 
 
