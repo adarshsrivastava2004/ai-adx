@@ -141,7 +141,7 @@ async def chat(req: ChatRequest):
                 # Step 5: Data Formatting
                 # -----------------------
                 # We truncate data to 15 rows to prevent crashing the LLM context window
-                MAX_ROWS_FOR_LLM = 15
+                MAX_ROWS_FOR_LLM = 100
                 # Note: ADX Client already handles datetime serialization
                 preview_data = data[:MAX_ROWS_FOR_LLM]
                 
